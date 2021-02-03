@@ -459,6 +459,9 @@ class BatchPayer():
         elif signed_bytes.startswith("sig"):  # generic signature
             decoded_sig_signature = decoded[6:][:-8]  # first 3 bytes sig, last 4 bytes checksum
             decoded_signature = decoded_sig_signature
+        elif signed_bytes.startswith("spsig"):
+            decoded_sig_signature = decoded[10:][:-8]  # first 5 bytes spsig, last 4 bytes checksum
+            decoded_signature = decoded_sig_signature
         elif signed_bytes.startswith("p2sig"):
             decoded_sig_signature = decoded[8:][:-8]  # first 4 bytes sig, last 4 bytes checksum
             decoded_signature = decoded_sig_signature

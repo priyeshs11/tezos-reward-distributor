@@ -401,7 +401,7 @@ def main(args):
     cfg_dict = parser.get_conf_obj()
 
     # dictionary to BakingConf object, for a bit of type safety
-    cfg = BakingConf(cfg_dict, master_cfg)
+    cfg = BakingConf(cfg_dict)
 
     config_file_path = os.path.join(os.path.abspath(config_dir), cfg.get_baking_address() + '.yaml')
     cfg_dict_plain = {k: v for k, v in cfg_dict.items() if not k.startswith('__')}
@@ -421,7 +421,7 @@ def load_config_file(clnt_mngr, network_config, master_cfg):
     cfg_dict = parser.get_conf_obj()
 
     # dictionary to BakingConf object, for a bit of type safety
-    cfg = BakingConf(cfg_dict, master_cfg)
+    cfg = BakingConf(cfg_dict)
 
     logger.info("Baking Configuration {}".format(cfg))
 
