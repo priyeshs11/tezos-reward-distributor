@@ -2,23 +2,21 @@ import _thread
 import csv
 import os
 import threading
-
-from time import sleep
 from datetime import datetime, timedelta
-
-from Constants import MUTEZ, RunMode, PaymentStatus
+from time import sleep
+from requests import ReadTimeout, ConnectTimeout
+from Constants import MUTEZ, RunMode
+from api.provider_factory import ProviderFactory
+from calc.phased_payment_calculator import PhasedPaymentCalculator
+from exception.api_provider import ApiProviderException
 from log_config import main_logger, get_verbose_log_helper
 from model.reward_log import RewardLog
 from model.rules_model import RulesModel
-from exception.api_provider import ApiProviderException
-from requests import ReadTimeout, ConnectTimeout
 from pay.double_payment_check import check_past_payment
 from pay.payment_batch import PaymentBatch
 from pay.payment_producer_abc import PaymentProducerABC
-from util.csv_payment_file_parser import CsvPaymentFileParser
-from calc.phased_payment_calculator import PhasedPaymentCalculator
-from util.dir_utils import get_calculation_report_file, get_failed_payments_dir, PAYMENT_FAILED_DIR, PAYMENT_DONE_DIR, \
-    remove_busy_file, BUSY_FILE
+from pay.retry_producer import RetryProducer
+from util.dir_utils import get_calculation_report_file, get_latest_report_file
 
 logger = main_logger.getChild("payment_producer")
 
@@ -28,7 +26,7 @@ BOOTSTRAP_SLEEP = 8
 class PaymentProducer(threading.Thread, PaymentProducerABC):
     def __init__(self, name, initial_payment_cycle, network_config, payments_dir, calculations_dir, run_mode,
                  service_fee_calc, release_override, payment_offset, baking_cfg, payments_queue, life_cycle,
-                 dry_run, client_manager, node_url, provider_factory, node_url_public='', api_base_url=None,
+                 dry_run, client_manager, node_url, reward_data_provider, node_url_public='', api_base_url=None,
                  retry_injected=False):
         super(PaymentProducer, self).__init__()
 
@@ -39,14 +37,13 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         self.founders_map = baking_cfg.get_founders_map()
         self.min_delegation_amt_in_mutez = baking_cfg.get_min_delegation_amount() * MUTEZ
         self.delegator_pays_xfer_fee = baking_cfg.get_delegator_pays_xfer_fee()
-
+        self.provider_factory = ProviderFactory(reward_data_provider)
         self.name = name
 
         self.node_url = node_url
         self.client_manager = client_manager
-        self.reward_api = provider_factory.newRewardApi(
-            network_config, self.baking_address, self.node_url, node_url_public, api_base_url)
-        self.block_api = provider_factory.newBlockApi(network_config, self.node_url, api_base_url)
+        self.reward_api = self.provider_factory.newRewardApi(network_config, self.baking_address, self.node_url, node_url_public, api_base_url)
+        self.block_api = self.provider_factory.newBlockApi(network_config, self.node_url, api_base_url)
 
         dexter_contracts_set = baking_cfg.get_contracts_set()
         if len(dexter_contracts_set) > 0 and not (self.reward_api.name == 'tzstats'):
@@ -58,6 +55,15 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         self.rewards_type = baking_cfg.get_rewards_type()
         self.fee_calc = service_fee_calc
         self.initial_payment_cycle = initial_payment_cycle
+
+        if self.initial_payment_cycle is None:
+            recent = get_latest_report_file(payments_dir)
+            # if payment logs exists set initial cycle to following cycle
+            # if payment logs does not exists, set initial cycle to 0, so that payment starts from last released rewards
+            self.initial_payment_cycle = 0 if recent is None else int(recent) + 1
+
+        logger.info("initial_cycle set to {}".format(self.initial_payment_cycle))
+
         self.nw_config = network_config
         self.payments_root = payments_dir
         self.calculations_dir = calculations_dir
@@ -76,6 +82,8 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         self.retry_fail_thread = threading.Thread(target=self.retry_fail_run, name=self.name + "_retry_fail")
         self.retry_fail_event = threading.Event()
         self.retry_injected = retry_injected
+
+        self.retry_producer = RetryProducer(self.payments_queue, self.reward_api, self, self.payments_root, self.retry_injected)
 
         logger.info('Producer "{}" started'.format(self.name))
 
@@ -96,7 +104,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         sleep(60)  # producer thread already tried once, wait for next try
 
         while not self.exiting and self.life_cycle.is_running():
-            self.retry_failed_payments()
+            self.retry_producer.retry_failed_payments()
 
             try:
                 # prepare to wait on event
@@ -107,13 +115,12 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             except RuntimeError:
                 pass
 
-        pass
-
     def run(self):
         # call first retry if not in onetime mode.
         # retry_failed script is more suitable for one time cases.
         if not self.run_mode == RunMode.ONETIME:
-            self.retry_failed_payments()
+            self.retry_producer.retry_failed_payments()
+
             if self.run_mode == RunMode.RETRY_FAILED:
                 sleep(5)
                 self.exit()
@@ -168,17 +175,21 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                 if pymnt_cycle <= current_cycle - (self.nw_config['NB_FREEZE_CYCLE'] + 1) - self.release_override:
                     if not self.payments_queue.full():
 
-                        expected_rewards = False
-
                         # Paying upcoming cycles (-R in [-6, -11] )
                         if pymnt_cycle >= current_cycle:
                             logger.warn("Please note that you are doing payouts for future rewards!!! These rewards are not earned yet, they are an estimation.")
-                            expected_rewards = True
+                            if not self.rewards_type.isIdeal():
+                                logger.error("For future rewards payout, you must configure the payout type to 'Ideal', see documentation")
+                                self.exit()
+                                break
 
                         # Paying cycles with frozen rewards (-R in [-1, -5] )
                         elif pymnt_cycle >= current_cycle - self.nw_config['NB_FREEZE_CYCLE']:
                             logger.warn("Please note that you are doing payouts for frozen rewards!!!")
-                            expected_rewards = True if self.reward_api.name == 'RPC' else False
+                            if (not self.rewards_type.isIdeal()) and self.reward_api.name == 'RPC':
+                                logger.error("Paying out frozen rewards with Node RPC API and rewards type 'Actual' is unsupported, you must use TzKT or tzstats API")
+                                self.exit()
+                                break
 
                         # If user wants to offset payments within a cycle, check here
                         if level_in_cycle < self.payment_offset:
@@ -188,7 +199,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                             continue  # Break/Repeat loop
 
                         else:
-                            result = self.try_to_pay(pymnt_cycle, expected_rewards=expected_rewards)
+                            result = self.try_to_pay(pymnt_cycle, expected_rewards=self.rewards_type.isIdeal())
 
                         if result:
                             # single run is done. Do not continue.
@@ -258,8 +269,6 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                 return True
 
             # 1- get reward data
-            # Expected rewards and ideal rewards are the same thing
-            expected_rewards = expected_rewards or self.rewards_type.isIdeal()
             if expected_rewards:
                 logger.info("Using expected/ideal rewards for payouts calculations")
             else:
@@ -391,84 +400,6 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
     @staticmethod
     def create_exit_payment():
         return RewardLog.ExitInstance()
-
-    def retry_failed_payments(self):
-        logger.debug("retry_failed_payments started")
-
-        # 1 - list csv files under payments/failed directory
-        # absolute path of csv files found under payments_root/failed directory
-        failed_payments_dir = get_failed_payments_dir(self.payments_root)
-        payment_reports_failed = [os.path.join(failed_payments_dir, x) for x in
-                                  os.listdir(failed_payments_dir) if x.endswith('.csv')]
-
-        if payment_reports_failed:
-            payment_reports_failed = sorted(payment_reports_failed, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-            logger.debug("Failed payment files found are: '{}'".format(",".join(payment_reports_failed)))
-        else:
-            logger.info("No failed payment files found under directory '{}'".format(failed_payments_dir))
-
-        # 2- for each csv file with name csv_report.csv
-        for payment_failed_report_file in payment_reports_failed:
-            logger.info("Working on failed payment file {}".format(payment_failed_report_file))
-
-            # 2.1 - if there is a file csv_report.csv under payments/done, it means payment is already done
-            if os.path.isfile(payment_failed_report_file.replace(PAYMENT_FAILED_DIR, PAYMENT_DONE_DIR)):
-                # remove payments/failed/csv_report.csv
-                os.remove(payment_failed_report_file)
-                logger.info("Payment for failed payment {} is already done. Removing.".format(payment_failed_report_file))
-
-                # remove payments/failed/csv_report.csv.BUSY
-                # if there is a busy failed payment report file, remove it.
-                remove_busy_file(payment_failed_report_file)
-
-                # do not double pay
-                continue
-
-            # 2.2 - if queue is full, wait for sometime
-            # make sure the queue is not full
-            while self.payments_queue.full():
-                logger.debug("Payments queue is full. Wait a few minutes.")
-                sleep(60 * 3)
-
-            cycle = int(os.path.splitext(os.path.basename(payment_failed_report_file))[0])
-
-            # 2.3 read payments/failed/csv_report.csv file into a list of dictionaries
-            batch = CsvPaymentFileParser().parse(payment_failed_report_file, cycle)
-
-            nb_paid = len(list(filter(lambda f: f.paid == PaymentStatus.PAID, batch)))
-            nb_done = len(list(filter(lambda f: f.paid == PaymentStatus.DONE, batch)))
-            nb_injected = len(list(filter(lambda f: f.paid == PaymentStatus.INJECTED, batch)))
-            nb_failed = len(list(filter(lambda f: f.paid == PaymentStatus.FAIL, batch)))
-
-            logger.info("Summary {} paid, {} done, {} injected, {} fail".format(nb_paid, nb_done, nb_injected, nb_failed))
-
-            if self.retry_injected:
-                nb_converted = 0
-                for pl in batch:
-                    if pl.paid == PaymentStatus.INJECTED:
-                        pl.paid = PaymentStatus.FAIL
-                        nb_converted += 1
-                        logger.debug("Reward converted from %s to fail for cycle %s, address %s, amount %f, tz type %s",
-                                     pl.paid, pl.cycle, pl.address, pl.amount, pl.type)
-
-                if nb_converted:
-                    logger.info("{} rewards converted from injected to fail.".format(nb_converted))
-
-            # 2.4 - Filter batch to only include those which failed. No need to mess with PAID/DONE
-            batch = list(filter(lambda f: f.paid == PaymentStatus.FAIL, batch))
-
-            # 2.5 - Need to fetch current balance for addresses of any failed payments
-            self.reward_api.update_current_balances(batch)
-
-            # 2.6 - put records into payment_queue. payment_consumer will make payments
-            self.payments_queue.put(PaymentBatch(self, cycle, batch))
-
-            # 2.7 - rename payments/failed/csv_report.csv to payments/failed/csv_report.csv.BUSY
-            # mark the files as in use. we do not want it to be read again
-            # BUSY file will be removed, if successful payment is done
-            os.rename(payment_failed_report_file, payment_failed_report_file + BUSY_FILE)
-
-        return
 
     def notify_retry_fail_thread(self):
         self.retry_fail_event.set()

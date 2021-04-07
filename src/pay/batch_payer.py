@@ -13,7 +13,8 @@ logger = main_logger
 
 MAX_TX_PER_BLOCK = 200
 PKH_LENGTH = 36
-PATIENCE = 10
+MAX_NUM_TRIALS_PER_BLOCK = 2
+MAX_BLOCKS_TO_CHECK_AFTER_INJECTION = 5
 
 COMM_DELEGATE_BALANCE = "/chains/main/blocks/{}/context/contracts/{}/balance"
 COMM_HEAD = "/chains/main/blocks/head"
@@ -37,7 +38,7 @@ RA_STORAGE = 300
 # This fee limit is set to allow payouts to ovens
 # Other KT accounts with higher fee requirements will be skipped
 # TODO: define set of known contract formats and make this fee for unknown contracts configurable
-FEE_LIMIT_CONTRACTS = 21000
+FEE_LIMIT_CONTRACTS = 100000
 
 # For simulation
 HARD_GAS_LIMIT_PER_OPERATION = 1040000
@@ -49,7 +50,6 @@ MUTEZ_PER_GAS_UNIT = 0.1
 class BatchPayer():
     def __init__(self, node_url, pymnt_addr, clnt_mngr, delegator_pays_ra_fee, delegator_pays_xfer_fee,
                  network_config, plugins_manager, dry_run):
-        super(BatchPayer, self).__init__()
         self.pymnt_addr = pymnt_addr
         self.node_url = node_url
         self.clnt_mngr = clnt_mngr
@@ -62,7 +62,7 @@ class BatchPayer():
         if os.path.isfile(FEE_INI):
             config.read(FEE_INI)
         else:
-            logger.warn("File {} not found. Using default fee values".format(FEE_INI))
+            logger.warning("File {} not found. Using default fee values".format(FEE_INI))
 
         kttx = config['KTTX']
         self.gas_limit = kttx['gas_limit']
@@ -148,6 +148,13 @@ class BatchPayer():
             if pi.paid == PaymentStatus.FAIL:
                 pi.paid = PaymentStatus.UNDEFINED
 
+            # Check if payment item was skipped due to any of the phase calculations.
+            # Add any items which are marked as skipped to the returning array so that they are logged to reports.
+            if not pi.payable:
+                logger.info("Skipping payout to {:s} {:>10.6f}, reason: {:s}".format(pi.address, pi.amount / MUTEZ, pi.desc))
+                payment_logs.append(pi)
+                continue
+
             zt = self.zero_threshold
             if pi.needs_activation and self.delegator_pays_ra_fee:
                 # Need to apply this fee to only those which need reactivation
@@ -171,12 +178,13 @@ class BatchPayer():
         if not self.delegator_pays_xfer_fee:
             total_amount_to_pay += self.default_fee * len(payment_items)
 
-        payment_address_balance = self.__get_payment_address_balance()
+        payment_address_balance = self.get_payment_address_balance()
         logger.info("Total amount to pay out is {:,} mutez.".format(total_amount_to_pay))
-        logger.info("Current balance in payout address is {:,} mutez.".format(payment_address_balance))
         logger.info("{} payments will be done in {} batches".format(len(payment_items), len(payment_items_chunks)))
 
         if payment_address_balance is not None:
+
+            logger.info("Current balance in payout address is {:,} mutez.".format(payment_address_balance))
 
             number_future_payable_cycles = int(payment_address_balance / total_amount_to_pay) - 1
 
@@ -203,7 +211,7 @@ class BatchPayer():
                 message = "The payout address will soon run out of funds. The current balance, {:,} mutez, " \
                           "might not be sufficient for the next cycle".format(payment_address_balance)
 
-                logger.warn(message)
+                logger.warning(message)
                 self.plugins_manager.send_admin_notification(subject, message)
 
             else:
@@ -314,27 +322,30 @@ class BatchPayer():
             # Calculate actual used storage
             storage = 0
             if 'paid_storage_size_diff' in op['metadata']['operation_result']:
-                storage += op['metadata']['operation_result']['paid_storage_size_diff']
+                storage += int(op['metadata']['operation_result']['paid_storage_size_diff'])
             if "internal_operation_results" in op["metadata"]:
                 internal_operation_results = op["metadata"]["internal_operation_results"]
                 for internal_op in internal_operation_results:
                     if 'paid_storage_size_diff' in internal_op['result']:
-                        storage += internal_op['result']['paid_storage_size_diff']
+                        storage += int(internal_op['result']['paid_storage_size_diff'])
 
         else:
-            op_error = op["metadata"]["operation_result"]["errors"][0]["id"]
-            logger.error(
-                "Error while validating operation - Status: {}, Message: {}".format(status, op_error))
+            op_error = "Unknown error in simulating contract payout. Payment will be skipped!"
+            if "errors" in op["metadata"]["operation_result"] and len(op["metadata"]["operation_result"]["errors"]) > 0 and "id" in op["metadata"]["operation_result"]["errors"][0]:
+                op_error = op["metadata"]["operation_result"]["errors"][0]["id"]
+            logger.debug("Error while validating operation - Status: {}, Message: {}".format(status, op_error))
             return PaymentStatus.FAIL, []
 
         # Calculate needed fee for extra consumed gas
-        tx_fee += int((consumed_gas - int(self.gas_limit)) * MUTEZ_PER_GAS_UNIT)
+        tx_fee += int(consumed_gas * MUTEZ_PER_GAS_UNIT)
         simulation_results = consumed_gas, tx_fee, storage
         return PaymentStatus.DONE, simulation_results
 
     def attempt_single_batch(self, payment_records, op_counter, dry_run=None):
         if not op_counter.get():
-            _, counter = self.clnt_mngr.request_url(self.comm_counter)
+            status, counter = self.clnt_mngr.request_url(self.comm_counter)
+            if status != 200:
+                raise Exception("Received response code {} for request '{}'".format(status, self.comm_counter))
             counter = int(counter)
             self.base_counter = int(counter)
             op_counter.set(self.base_counter)
@@ -358,6 +369,8 @@ class BatchPayer():
             if payment_item.paymentaddress.startswith('KT'):
                 simulation_status, simulation_results = self.simulate_single_operation(payment_item, pymnt_amnt, branch, chain_id)
                 if simulation_status == PaymentStatus.FAIL:
+                    logger.info("Payment to {} script could not be processed (Possible reason: liquidated contract). Skipping. (think about redirecting the payout to the owner address using the maps rules. Please refer to the TRD documentation or to one of the TRD maintainers)"
+                                .format(payment_item.paymentaddress))
                     payment_item.paid = PaymentStatus.FAIL
                     continue
                 gas_limit, tx_fee, storage = simulation_results
@@ -365,8 +378,8 @@ class BatchPayer():
                 total_fee = tx_fee + burn_fee
                 # Bound the total (baker and burn) fee by the reward amount in case of KT1 accounts
                 if total_fee > FEE_LIMIT_CONTRACTS:
-                    logger.debug("Payment to {} script requires higher fees than reward amount. Skipping."
-                                 .format(payment_item.paymentaddress))
+                    logger.info("Payment to {} script requires higher fees than reward amount. Skipping. (Needed fee: {} muTez, Max fee: {} muTez, think about either configuring higher fees or redirecting to the owner address using the maps rules. Please refer to the TRD documentation or to one of the TRD maintainers."
+                                .format(payment_item.paymentaddress, total_fee, FEE_LIMIT_CONTRACTS))
                     payment_item.paid = PaymentStatus.FAIL
                     continue
 
@@ -380,8 +393,7 @@ class BatchPayer():
 
             # if pymnt_amnt becomes 0, don't pay
             if pymnt_amnt == 0:
-                logger.debug(
-                    "Payment to {} became 0 after deducting fees. Skipping.".format(payment_item.paymentaddress))
+                logger.debug("Payment to {} became 0 after deducting fees. Skipping.".format(payment_item.paymentaddress))
                 continue
 
             op_counter.inc()
@@ -419,7 +431,6 @@ class BatchPayer():
                     return PaymentStatus.FAIL, ""
             except KeyError:
                 logger.debug("Unable to find metadata->operation_result->{status,errors} in run_ops response")
-                pass
 
         # forge the operations
         logger.debug("Forging {} operations".format(len(content_list)))
@@ -488,22 +499,36 @@ class BatchPayer():
         logger.info("Operation hash is {}".format(operation_hash))
 
         # wait for inclusion
-        logger.info("Waiting for operation {} to be included...".format(operation_hash))
-        for i in range(last_level_before_injection + 1, last_level_before_injection + 6):
-            sleep(self.network_config['BLOCK_TIME_IN_SEC'])
-            cmd = self.comm_wait.replace("%BLOCK_HASH%", 'head')
-            status, list_op_hash = self.clnt_mngr.request_url(cmd, timeout=self.network_config['BLOCK_TIME_IN_SEC'] * PATIENCE)
+        timeout = MAX_BLOCKS_TO_CHECK_AFTER_INJECTION * MAX_NUM_TRIALS_PER_BLOCK * self.network_config['BLOCK_TIME_IN_SEC'] // 60
+        logger.info("Waiting for operation {} to be included... Please do not interrupt the process!!! (Timeout is around {} minutes)".format(operation_hash, timeout))
+        for i in range(last_level_before_injection + 1, last_level_before_injection + 1 + MAX_BLOCKS_TO_CHECK_AFTER_INJECTION):
+            cmd = self.comm_wait.replace("%BLOCK_HASH%", str(i))
+            status = -1
+            list_op_hash = []
+            trial_i = 0
+            while not (status == 200) and (trial_i < MAX_NUM_TRIALS_PER_BLOCK):
+                sleep(self.network_config['BLOCK_TIME_IN_SEC'])
+                status, list_op_hash = self.clnt_mngr.request_url(cmd)
+            if not (status == 200):
+                logger.warning("Level {} could not be queried about operation hashes".format(i))
+                break
             for op_hashes in list_op_hash:
                 if operation_hash in op_hashes:
                     logger.info("Operation {} is included".format(operation_hash))
                     return PaymentStatus.PAID, operation_hash
+            logger.debug("Operation {} is not included at level {}".format(operation_hash, i))
 
-        logger.warn("Operation {} wait is timed out. Not sure about the result!".format(operation_hash))
+        logger.warning("Operation {} wait is timed out. Not sure about the result!".format(operation_hash))
         return PaymentStatus.INJECTED, operation_hash
 
-    def __get_payment_address_balance(self):
+    def get_payment_address_balance(self):
         get_current_balance_request = COMM_DELEGATE_BALANCE.format("head", self.source)
         status, payment_address_balance = self.clnt_mngr.request_url(get_current_balance_request)
+
+        if status != 200:
+            logger.warning("Balance request failed! Response code {} is received for request '{}'. See verbose logs for more detail.".format(status, get_current_balance_request))
+            return None
+
         return int(payment_address_balance)
 
 
