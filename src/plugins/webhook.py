@@ -32,9 +32,9 @@ class WebhookPlugin(plugins.Plugin):
         # Loop over reward_data (RewardLogs) and append
         for i in reward_data:
             payout = {"address": i.address, "paymentAddress": i.paymentaddress,
-                      "addressType": i.type, "cycle": i.cycle, "stakingBalance": i.staking_balance,
+                      "addressType": i.type, "cycle": i.cycle, "stakingBalance": int(i.staking_balance),
                       "ratio": round(i.ratio, 8), "feeRatio": round(i.service_fee_ratio, 8),
-                      "amount": i.amount, "feeAmount": i.service_fee_amount, "feeRate": i.service_fee_rate,
+                      "amount": int(i.amount), "feeAmount": int(i.service_fee_amount), "feeRate": i.service_fee_rate,
                       "payable": i.payable, "skipped": i.skipped, "opHash": i.hash,
                       "neededActivation": i.needs_activation, "paymentStatus": i.paid.name
                       }
