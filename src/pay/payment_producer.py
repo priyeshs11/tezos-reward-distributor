@@ -58,8 +58,8 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
 
         if self.initial_payment_cycle is None:
             recent = get_latest_report_file(payments_dir)
-            # if payment logs exists set initial cycle to following cycle
-            # if payment logs does not exists, set initial cycle to 0, so that payment starts from last released rewards
+            # if successful payment logs exist (in "done" directory), set initial cycle to following cycle
+            # if succesful payment logs do not exist, set initial cycle to 0, so that payment starts from last released rewards
             self.initial_payment_cycle = 0 if recent is None else int(recent) + 1
 
         logger.info("initial_cycle set to {}".format(self.initial_payment_cycle))
@@ -139,9 +139,9 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             return
 
         # if non-positive initial_payment_cycle, set initial_payment_cycle to
-        # 'current cycle - abs(initial_cycle) - (NB_FREEZE_CYCLE+1)'
+        # 'current cycle - abs(initial_cycle) - (NB_FREEZE_CYCLE+1) - self.release_override'
         if self.initial_payment_cycle <= 0:
-            pymnt_cycle = current_cycle - abs(self.initial_payment_cycle) - (self.nw_config['NB_FREEZE_CYCLE'] + 1)
+            pymnt_cycle = current_cycle - abs(self.initial_payment_cycle) - (self.nw_config['NB_FREEZE_CYCLE'] + 1) - self.release_override
             logger.debug("Payment cycle is set to {}".format(pymnt_cycle))
 
         get_verbose_log_helper().reset(pymnt_cycle)
@@ -186,10 +186,6 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                         # Paying cycles with frozen rewards (-R in [-1, -5] )
                         elif pymnt_cycle >= current_cycle - self.nw_config['NB_FREEZE_CYCLE']:
                             logger.warn("Please note that you are doing payouts for frozen rewards!!!")
-                            if (not self.rewards_type.isIdeal()) and self.reward_api.name == 'RPC':
-                                logger.error("Paying out frozen rewards with Node RPC API and rewards type 'Actual' is unsupported, you must use TzKT or tzstats API")
-                                self.exit()
-                                break
 
                         # If user wants to offset payments within a cycle, check here
                         if level_in_cycle < self.payment_offset:
